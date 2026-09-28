@@ -1,0 +1,136 @@
+import pandas as pd
+import duckdb as db
+
+# ============ DATOS: BODEGA CENTRAL GYE ============
+bodega = {
+    'codigo': ['REC-001','REC-002','REC-003','rec-004','REC-005','REC-005','REC-006','REC-007','REC-008','REC-009','REC-010','REC-011','REC-012'],
+    'fecha': ['2026-08-01','2026-08-01','02/08/2026','2026-08-02','2026-08-03','2026-08-03','2026-08-03','2026-08-04','2026-08-04','2026-08-05','2026-08-05','2026-08-05','2026-08-06'],
+    'proveedor': ['Distribuidora Alvarado','dist. alvarado','LACTEOS DEL SUR','Lacteos del Sur','Carnes Premium','Carnes Premium','carnes premium','Distribuidora Alvarado','Dist. Alvarado',None,'LACTEOS DEL SUR','Carnes Premium','distribuidora alvarado'],
+    'producto': ['Leche 1L','Leche 1L','Queso fresco 500g','queso fresco 500g','Res molida 1kg','Res molida 1kg','Pollo entero','Yogurt 1L','yogurt 1L','Leche 1L','Queso fresco 500g','Pollo entero','Leche 1L'],
+    'cantidad': [200, 150, 80, None, 120, 120, 'noventa', -15, 95, 60, 100, 85, 110],
+    'precio_unit': [1.25, 1.25, 3.50, 3.50, 5.80, 5.80, 4.20, 1.80, 1.80, 1.25, 3.50, '4,20', 1.25],
+    'estado': ['recibido','RECIBIDO','recibido','recibido - dañado','recibido','recibido','recibido','DEVUELTO','recibido','recibido','Recibido','recibido','recibido tarde'],
+    'temp_recepcion': [4.1, 4.0, 3.8, 8.5, -1.2, -1.2, 3.5, 4.2, 4.1, None, 3.9, 3.6, 4.3]
+}
+
+# ============ PANDAS: LIMPIEZA PREVIA ============
+df = pd.DataFrame(bodega)
+df.columns = df.columns.str.strip()
+
+cantidad_backup = df['cantidad'].copy()
+precio_backup = df['precio_unit'].copy()
+temp_backup = df['temp_recepcion'].copy()
+
+for col in df.select_dtypes(include='object').columns:
+    df[col] = df[col].str.strip()
+
+df['cantidad'] = cantidad_backup
+df['precio_unit'] = precio_backup
+df['temp_recepcion'] = temp_backup
+
+# ============ REGISTRO EN DUCKDB ============
+con = db.connect()
+con.register('bodega_raw', df)
+
+# ============ PIPELINE DE LIMPIEZA ============
+limpieza = r"""
+WITH raw_data AS (
+    SELECT 
+        UPPER(codigo) AS codigo,
+        CASE
+            WHEN fecha LIKE '%-%' THEN TRY_CAST(fecha AS DATE)
+            ELSE TRY_CAST(strptime(fecha, '%d/%m/%Y') AS DATE)
+        END AS fecha,
+        CASE
+            WHEN regexp_matches(LOWER(proveedor), 'distribuidora\s*?alvarado|dist\.?\s*alvarado') THEN 'Distribuidora Alvarado'
+            WHEN regexp_matches(LOWER(proveedor), 'lacteos') THEN 'Lacteos del Sur'
+            WHEN regexp_matches(LOWER(proveedor), 'carnes') THEN 'Carnes Premium'
+            ELSE proveedor
+        END AS proveedor,
+        LOWER(producto) AS producto,
+        TRY_CAST(CAST(cantidad AS VARCHAR) AS INTEGER) AS cantidad,
+        TRY_CAST(REPLACE(CAST(precio_unit AS VARCHAR), ',', '.') AS DOUBLE) AS precio_unit,
+        TRY_CAST(CAST(temp_recepcion AS VARCHAR) AS DOUBLE) AS temp_recepcion,
+        UPPER(estado) AS estado
+    FROM bodega_raw
+),
+cte_limpio AS (
+    SELECT DISTINCT
+        codigo,
+        fecha,
+        proveedor,
+        producto,
+        CASE WHEN cantidad < 0 THEN NULL ELSE cantidad END AS cantidad,
+        precio_unit,
+        CASE
+            WHEN regexp_matches(estado, 'TARDE|DAÑADO|DEVUELTO') THEN 1
+            ELSE 0
+        END AS tiene_problema,
+        CASE
+            WHEN temp_recepcion < 0 THEN NULL
+            WHEN temp_recepcion > 8 THEN NULL
+            ELSE temp_recepcion
+        END AS temp_recepcion,
+        estado
+    FROM raw_data
+    WHERE proveedor IS NOT NULL
+)
+SELECT * FROM cte_limpio ORDER BY codigo
+"""
+
+df_limpio = con.sql(limpieza).df()
+con.register('bodega_limpia', df_limpio)
+
+# ============ ANALISIS 1: RECEPCIONES POR PROVEEDOR ============
+q1 = r"""
+SELECT 
+    proveedor,
+    COUNT(*) AS total_recepciones,
+    SUM(cantidad) AS total_unidades
+FROM bodega_limpia
+GROUP BY proveedor
+ORDER BY total_recepciones DESC
+"""
+print("=== RECEPCIONES POR PROVEEDOR ===")
+print(con.sql(q1).df())
+
+# ============ ANALISIS 2: VALOR EN DOLARES POR PROVEEDOR ============
+q2 = r"""
+SELECT 
+    proveedor,
+    SUM(cantidad * precio_unit) AS valor_total_usd
+FROM bodega_limpia
+GROUP BY proveedor
+ORDER BY valor_total_usd DESC
+"""
+print("\n=== VALOR EN DOLARES POR PROVEEDOR ===")
+print(con.sql(q2).df())
+
+# ============ ANALISIS 3: PROBLEMAS POR PROVEEDOR ============
+q3 = r"""
+SELECT 
+    proveedor,
+    COUNT(*) AS total_recepciones,
+    SUM(tiene_problema) AS recepciones_con_problema,
+    ROUND(SUM(tiene_problema) * 100.0 / COUNT(*), 1) AS pct_problemas,
+    AVG(temp_recepcion) AS temp_promedio
+FROM bodega_limpia
+GROUP BY proveedor
+ORDER BY pct_problemas DESC
+"""
+print("\n=== PROBLEMAS Y TEMPERATURA POR PROVEEDOR ===")
+print(con.sql(q3).df())
+
+# ============ ANALISIS 4: PROVEEDORES CON MAS DE 3 RECEPCIONES ============
+q4 = r"""
+SELECT 
+    proveedor,
+    COUNT(*) AS total_recepciones,
+    SUM(cantidad * precio_unit) AS valor_total_usd,
+    ROUND(SUM(tiene_problema) * 100.0 / COUNT(*), 1) AS pct_problemas
+FROM bodega_limpia
+GROUP BY proveedor
+HAVING COUNT(*) > 3
+"""
+print("\n=== PROVEEDORES CON MAS DE 3 RECEPCIONES ===")
+print(con.sql(q4).df())
