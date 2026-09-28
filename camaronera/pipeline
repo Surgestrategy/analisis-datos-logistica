@@ -1,0 +1,134 @@
+import pandas as pd
+import duckdb as db
+
+# ============ DATOS: CAMARONERA ============
+camaronera = {
+    'piscina': ['P1','P1','P2','P2','P3','P3','P4','P4','P1','P2'],
+    'fecha': ['2026-07-01','2026-07-02','2026-07-01','2026-07-02','2026-07-01','2026-07-02','2026-07-01','2026-07-02','2026-07-03','2026-07-03'],
+    'libras_camaron': ['15000','14500','12000','11800',None,'9500','18000','mil cien','15200','12100'],
+    'libras_balanceado': ['4500','4600','3800','3700','3500','3600','5200','5100','4700','3900'],
+    'temperatura': [14.2, 14.0, 13.8, 14.1, -5.0, 13.9, 14.3, 14.0, 13.7, 14.2],
+    'mortalidad_lb': [200, 180, 150, 300, None, 450, 100, 90, 210, 160],
+    'precio_camaron_lb': [4.20, 4.20, 4.20, 4.20, 4.20, 4.20, 4.20, 4.20, 4.20, 4.20],
+    'precio_balanceado_lb': [0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65, 0.65],
+    'notas': [
+        'Produccion normal, revisaron 380 lb en buen estado',
+        'Lote ok, ninguna novedad',
+        'Se revisaron 250 lb, estado aceptable',
+        'Mortalidad alta, posible estres termico',
+        'Sensor danado, no hay lectura confiable',
+        'Mortalidad critica, se activo protocolo',
+        'Mejor piscina del ciclo',
+        'Registro manual dice mil cien libras',
+        'Produccion estable post-revision',
+        'Lote revisado, sin novedad'
+    ]
+}
+
+# ============ PANDAS: LIMPIEZA PREVIA ============
+df = pd.DataFrame(camaronera)
+df.columns = df.columns.str.strip()
+
+camaron_backup = df['libras_camaron'].copy()
+
+for col in df.select_dtypes(include='object').columns:
+    df[col] = df[col].str.strip()
+
+df['libras_camaron'] = camaron_backup
+
+# ============ REGISTRO EN DUCKDB ============
+con = db.connect()
+con.register('camaronera_raw', df)
+
+# ============ PIPELINE DE LIMPIEZA ============
+limpieza = r"""
+WITH cte_estandarizar AS (
+    SELECT 
+        UPPER(piscina) AS piscina,
+        TRY_CAST(fecha AS DATE) AS fecha,
+        TRY_CAST(CAST(libras_camaron AS VARCHAR) AS DOUBLE) AS libras_camaron,
+        TRY_CAST(CAST(libras_balanceado AS VARCHAR) AS DOUBLE) AS libras_balanceado,
+        CASE
+            WHEN temperatura < 0 THEN NULL
+            ELSE temperatura
+        END AS temperatura,
+        mortalidad_lb,
+        precio_camaron_lb,
+        precio_balanceado_lb,
+        LOWER(notas) AS notas,
+        regexp_extract(LOWER(notas), 'revis\w*.*?([0-9]+)', 1) AS lb_revisadas
+    FROM camaronera_raw
+),
+cte_limpio AS (
+    SELECT DISTINCT * FROM cte_estandarizar
+)
+SELECT * FROM cte_limpio ORDER BY piscina, fecha
+"""
+
+df_limpio = con.sql(limpieza).df()
+con.register('camaronera_limpia', df_limpio)
+
+# ============ ANALISIS 1: PERDIDA POR PISCINA ============
+q1 = r"""
+SELECT 
+    piscina,
+    SUM(mortalidad_lb) AS total_mortalidad_lb,
+    ROUND(SUM(mortalidad_lb * precio_camaron_lb), 2) AS perdida_camaron_usd,
+    ROUND(SUM(mortalidad_lb * precio_balanceado_lb), 2) AS balanceado_desperdiciado_usd,
+    ROUND(SUM(mortalidad_lb * precio_camaron_lb) + SUM(mortalidad_lb * precio_balanceado_lb), 2) AS perdida_total_usd
+FROM camaronera_limpia
+WHERE mortalidad_lb IS NOT NULL
+GROUP BY piscina
+ORDER BY perdida_total_usd DESC
+"""
+print("=== PERDIDA TOTAL POR PISCINA ===")
+print(con.sql(q1).df())
+
+# ============ ANALISIS 2: TEMPERATURA PROMEDIO POR PISCINA ============
+q2 = r"""
+SELECT 
+    piscina,
+    ROUND(AVG(temperatura), 2) AS temp_promedio,
+    MIN(temperatura) AS temp_minima,
+    MAX(temperatura) AS temp_maxima
+FROM camaronera_limpia
+WHERE temperatura IS NOT NULL
+GROUP BY piscina
+ORDER BY piscina
+"""
+print("\n=== TEMPERATURA POR PISCINA ===")
+print(con.sql(q2).df())
+
+# ============ ANALISIS 3: TENDENCIA DE MORTALIDAD POR PISCINA ============
+q3 = r"""
+SELECT 
+    piscina,
+    fecha,
+    mortalidad_lb,
+    SUM(mortalidad_lb) OVER(PARTITION BY piscina ORDER BY fecha) AS mortalidad_acumulada,
+    LAG(mortalidad_lb) OVER(PARTITION BY piscina ORDER BY fecha) AS mortalidad_anterior,
+    mortalidad_lb - LAG(mortalidad_lb) OVER(PARTITION BY piscina ORDER BY fecha) AS cambio
+FROM camaronera_limpia
+WHERE mortalidad_lb IS NOT NULL
+ORDER BY piscina, fecha
+"""
+print("\n=== TENDENCIA DE MORTALIDAD POR PISCINA ===")
+print(con.sql(q3).df())
+
+# ============ ANALISIS 4: FCR POR PISCINA ============
+q4 = r"""
+SELECT 
+    piscina,
+    ROUND(SUM(libras_balanceado) / NULLIF(SUM(libras_camaron), 0), 2) AS fcr,
+    CASE
+        WHEN SUM(libras_balanceado) / NULLIF(SUM(libras_camaron), 0) < 1.5 THEN 'EFICIENTE'
+        WHEN SUM(libras_balanceado) / NULLIF(SUM(libras_camaron), 0) < 2.0 THEN 'NORMAL'
+        ELSE 'INEFICIENTE'
+    END AS clasificacion
+FROM camaronera_limpia
+WHERE libras_camaron IS NOT NULL
+GROUP BY piscina
+ORDER BY fcr
+"""
+print("\n=== FCR POR PISCINA ===")
+print(con.sql(q4).df())
